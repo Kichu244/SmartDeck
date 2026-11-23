@@ -1,16 +1,31 @@
 package com.example.smartdeck
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -28,20 +43,26 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
+import androidx.core.content.ContextCompat
 import com.example.smartdeck.ui.theme.SmartDeckTheme
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.roundToInt
 
 // -----------------------------------------------------------------------------
 // PALETTE
@@ -59,11 +80,11 @@ private val StatusGrey = Color(0xFF64748B)
 private val StatusOrange = Color(0xFFFBBF24)
 private val StatusRed = Color(0xFFF87171)
 
-// Control Center specific
 private val CCGlass = Color(0xFF2A3447).copy(alpha = 0.92f)
 private val CCWhite = Color(0xFFF2F2F7)
 private val CCDarkIcon = Color(0xFF111827)
 private val CCRound = Color(0xFF3A4660)
+private val PanelBg = Color(0xFF1E2840)
 
 // -----------------------------------------------------------------------------
 // ACTIVITY
@@ -86,75 +107,148 @@ class MainActivity : ComponentActivity() {
 }
 
 // -----------------------------------------------------------------------------
-// SHARED STATE (hoisted so values survive page switches)
+// STATE
 // -----------------------------------------------------------------------------
+
+/** Everything that belongs to the PC side. */
 class DeckState {
     var volume by mutableFloatStateOf(68f)
     var brightness by mutableFloatStateOf(80f)
     var playing by mutableStateOf(true)
 
-    var wifi by mutableStateOf(true)
-    var bluetooth by mutableStateOf(true)
+    var pcWifi by mutableStateOf(true)
+    var pcBluetooth by mutableStateOf(true)
     var airplane by mutableStateOf(false)
     var hotspot by mutableStateOf(true)
 
-    // Names shown next to Wi-Fi / Bluetooth icons (wire these to real values later)
-    var wifiName by mutableStateOf("Home_5G")
-    var btDevice by mutableStateOf("Galaxy Buds")
-
-    // Battery (updated from the system)
-    var batteryLevel by mutableIntStateOf(100)
-    var charging by mutableStateOf(false)
-
-    // 0 = Sound, 1 = Vibrate, 2 = Mute
-    var soundMode by mutableIntStateOf(0)
-    val muted: Boolean get() = soundMode == 2
-    fun cycleSound() { soundMode = (soundMode + 1) % 3 }
-
-    val wifiConnected: Boolean get() = wifi && !airplane
-    val btConnected: Boolean get() = bluetooth && !airplane
-
-    // Generic on/off flags for extra tiles
     val flags = mutableStateMapOf<String, Boolean>()
     fun on(key: String) = flags[key] ?: false
     fun flip(key: String) { flags[key] = !on(key) }
 }
 
+/** Everything that belongs to THIS phone/tablet (read from the system). */
+class MobileState {
+    var batteryLevel by mutableIntStateOf(100)
+    var charging by mutableStateOf(false)
+
+    var wifiEnabled by mutableStateOf(false)
+    var wifiConnected by mutableStateOf(false)
+    var wifiName by mutableStateOf<String?>(null)
+
+    var btEnabled by mutableStateOf(false)
+    var btDevice by mutableStateOf<String?>(null)
+
+    // 0 = Sound, 1 = Vibrate, 2 = Mute
+    var soundMode by mutableIntStateOf(0)
+}
+
+@Suppress("DEPRECATION")
+fun MobileState.refresh(ctx: Context) {
+    val app = ctx.applicationContext
+
+    // Battery
+    try {
+        ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let { i ->
+            val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+            if (level >= 0 && scale > 0) batteryLevel = level * 100 / scale
+            val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            charging = st == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    st == BatteryManager.BATTERY_STATUS_FULL
+        }
+    } catch (e: Exception) { }
+
+    // Wi-Fi (this device)
+    try {
+        val wm = app.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val cm = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        wifiEnabled = wm.isWifiEnabled
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        wifiConnected = wifiEnabled && caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        val ssid = wm.connectionInfo?.ssid?.trim('"')
+        wifiName = if (wifiConnected && !ssid.isNullOrBlank() && ssid != "<unknown ssid>") ssid else null
+    } catch (e: Exception) { }
+
+    // Bluetooth (this device)
+    try {
+        val adapter = (app.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        btEnabled = adapter?.isEnabled == true
+        val hasPerm = Build.VERSION.SDK_INT < 31 ||
+                ContextCompat.checkSelfPermission(app, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        if (adapter != null && btEnabled && hasPerm) {
+            queryBtDevice(app, adapter, listOf(BluetoothProfile.A2DP, BluetoothProfile.HEADSET)) { btDevice = it }
+        } else {
+            btDevice = null
+        }
+    } catch (e: Exception) { }
+
+    // Ringer mode (this device)
+    try {
+        val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        soundMode = when (am.ringerMode) {
+            AudioManager.RINGER_MODE_NORMAL -> 0
+            AudioManager.RINGER_MODE_VIBRATE -> 1
+            else -> 2
+        }
+    } catch (e: Exception) { }
+}
+
+@android.annotation.SuppressLint("MissingPermission")
+fun queryBtDevice(ctx: Context, adapter: BluetoothAdapter, profiles: List<Int>, onResult: (String?) -> Unit) {
+    if (profiles.isEmpty()) { onResult(null); return }
+    val ok = adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
+        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+            val name = try { proxy.connectedDevices.firstOrNull()?.name } catch (e: SecurityException) { null }
+            adapter.closeProfileProxy(profile, proxy)
+            if (name != null) onResult(name) else queryBtDevice(ctx, adapter, profiles.drop(1), onResult)
+        }
+        override fun onServiceDisconnected(profile: Int) {}
+    }, profiles.first())
+    if (!ok) queryBtDevice(ctx, adapter, profiles.drop(1), onResult)
+}
+
 // -----------------------------------------------------------------------------
-// PC ACTION BUTTONS: add / remove entries here, the grid places them automatically
+// PC TILE DEFINITIONS (add / remove entries here)
 // -----------------------------------------------------------------------------
-data class PcAction(
+data class PcTileDef(
     val id: String,
     val label: String,
     val icon: ImageVector,
+    val colSpan: Int = 1,
+    val rowSpan: Int = 1,
+    val isAction: Boolean = false,
     val danger: Boolean = false
 )
 
-val PcActions = listOf(
-    PcAction("lock", "Lock", Icons.Default.Lock),
-    PcAction("sleep", "Sleep", Icons.Default.Bedtime),
-    PcAction("restart", "Restart", Icons.Default.Refresh),
-    PcAction("shutdown", "Shut Down", Icons.Default.PowerSettingsNew, danger = true),
-    PcAction("screenshot", "Screenshot", Icons.Default.CameraAlt),
-    PcAction("taskmgr", "Task Mgr", Icons.Default.Memory),
-    PcAction("desktop", "Desktop", Icons.Default.DesktopWindows),
-    PcAction("alttab", "Alt+Tab", Icons.Default.SwapHoriz),
-    PcAction("copy", "Copy", Icons.Default.ContentCopy),
-    PcAction("paste", "Paste", Icons.Default.ContentPaste),
-    PcAction("undo", "Undo", Icons.Default.Undo),
-    PcAction("explorer", "Explorer", Icons.Default.Folder),
-    PcAction("browser", "Browser", Icons.Default.Public),
-    PcAction("terminal", "Terminal", Icons.Default.Terminal),
-    PcAction("calc", "Calculator", Icons.Default.Calculate),
-    PcAction("pcsettings", "Settings", Icons.Default.Settings)
+val PcTileDefs = listOf(
+    PcTileDef("wifi", "Wi-Fi", Icons.Default.Router, 2, 1),
+    PcTileDef("bluetooth", "Bluetooth", Icons.Default.Bluetooth, 2, 1),
+    PcTileDef("connect", "Toggles", Icons.Default.Tune, 2, 2),
+    PcTileDef("brightness", "Bright", Icons.Default.BrightnessHigh, 1, 3),
+    PcTileDef("volume", "Volume", Icons.Default.VolumeUp, 1, 3),
+    PcTileDef("media", "Media", Icons.Default.MusicNote, 4, 2),
+    PcTileDef("dark", "Dark", Icons.Default.DarkMode),
+    PcTileDef("lowpower", "Saver", Icons.Default.BatterySaver),
+
+    PcTileDef("lock", "Lock", Icons.Default.Lock, isAction = true),
+    PcTileDef("sleep", "Sleep", Icons.Default.Bedtime, isAction = true),
+    PcTileDef("restart", "Restart", Icons.Default.Refresh, isAction = true),
+    PcTileDef("shutdown", "Shut Down", Icons.Default.PowerSettingsNew, isAction = true, danger = true),
+    PcTileDef("screenshot", "Screenshot", Icons.Default.CameraAlt, isAction = true),
+    PcTileDef("desktop", "Desktop", Icons.Default.DesktopWindows, isAction = true),
+    PcTileDef("alttab", "Alt+Tab", Icons.Default.SwapHoriz, isAction = true),
+    PcTileDef("copy", "Copy", Icons.Default.ContentCopy, isAction = true),
+    PcTileDef("paste", "Paste", Icons.Default.ContentPaste, isAction = true),
+    PcTileDef("browser", "Browser", Icons.Default.Public, isAction = true)
 )
+
+fun defOf(id: String): PcTileDef = PcTileDefs.first { it.id == id }
 
 /** TODO: send the command to your PC agent (socket / HTTP / websocket). */
 fun sendPcCommand(id: String) { /* TODO */ }
 
 // -----------------------------------------------------------------------------
-// GRID MODEL: change layout by editing these lists only
-// col/row = top-left cell, colSpan/rowSpan = size in cells
+// GRID MODEL
 // -----------------------------------------------------------------------------
 data class Tile(
     val id: String,
@@ -164,27 +258,32 @@ data class Tile(
     val rowSpan: Int = 1
 )
 
+const val PC_COLS = 8
+const val PC_ROWS = 5
+const val BAG_CAPACITY = 9
+
 object DefaultLayouts {
-    // PC page: 8 columns x 5 rows (same setup as the Control Center)
-    val pc: List<Tile> = listOf(
+    // PC page: 8 x 5
+    val pc = listOf(
         Tile("wifi", 0, 0, 2, 1),
         Tile("bluetooth", 2, 0, 2, 1),
         Tile("connect", 4, 0, 2, 2),
         Tile("brightness", 6, 0, 1, 3),
         Tile("volume", 7, 0, 1, 3),
         Tile("media", 0, 1, 4, 2),
-        Tile("dark", 4, 2, 1, 1),
-        Tile("lowpower", 5, 2, 1, 1)
-    ) + PcActions.mapIndexed { i, a -> Tile(a.id, i % 8, 3 + i / 8) }
+        Tile("dark", 4, 2),
+        Tile("lowpower", 5, 2),
+
+        Tile("lock", 0, 3), Tile("sleep", 1, 3), Tile("restart", 2, 3), Tile("shutdown", 3, 3),
+        Tile("screenshot", 4, 3), Tile("desktop", 5, 3), Tile("alttab", 6, 3), Tile("copy", 7, 3),
+        Tile("paste", 0, 4), Tile("browser", 1, 4)
+    )
 
     val touchpad = listOf(
         Tile("pad", 0, 0, 4, 4),
         Tile("mouse", 4, 0, 2, 4)
     )
-    val keyboard = listOf(
-        Tile("keys", 0, 0, 6, 4)
-    )
-    // 6 columns x 5 rows
+    val keyboard = listOf(Tile("keys", 0, 0, 6, 4))
     val home = listOf(
         Tile("rooms", 0, 0, 6, 1),
         Tile("light", 0, 1, 2, 2),
@@ -199,10 +298,15 @@ object DefaultLayouts {
     )
 }
 
-/**
- * Fixed grid that always fits the available space (no scrolling, no clipping).
- * Cell size is computed from the real size, so it adapts to any screen.
- */
+/** Editable PC layout + the 3x3 "bag" of icons that are not on the grid. */
+class PcLayoutState {
+    val tiles = mutableStateListOf<Tile>().also { it.addAll(DefaultLayouts.pc) }
+    val bag = mutableStateListOf<String>()
+    fun reset() {
+        tiles.clear(); tiles.addAll(DefaultLayouts.pc); bag.clear()
+    }
+}
+
 @Composable
 fun TileGrid(
     columns: Int,
@@ -235,7 +339,6 @@ fun TileGrid(
 // -----------------------------------------------------------------------------
 // TOUCH HELPERS
 // -----------------------------------------------------------------------------
-/** Whole-area tap target with instant pressed feedback (scale-down). */
 @Composable
 fun Modifier.pressable(onClick: () -> Unit): Modifier {
     val source = remember { MutableInteractionSource() }
@@ -246,7 +349,6 @@ fun Modifier.pressable(onClick: () -> Unit): Modifier {
         .scale(s)
 }
 
-/** Vertical slider: tap or drag anywhere on the pill, responds instantly. */
 @Composable
 fun VerticalPillSlider(
     value: Float,
@@ -289,7 +391,6 @@ fun VerticalPillSlider(
     }
 }
 
-/** Ticks every second so the clock stays live. */
 @Composable
 fun rememberNow(): Date {
     var now by remember { mutableStateOf(Date()) }
@@ -307,35 +408,73 @@ fun rememberNow(): Date {
 // -----------------------------------------------------------------------------
 @Composable
 fun SmartDeckApp() {
-    val deck = remember { DeckState() }
     val ctx = LocalContext.current
-    var selectedPage by remember { mutableStateOf("PC Control") }
-    var pcConnected by remember { mutableStateOf(true) }
+    val deck = remember { DeckState() }
+    val mobile = remember { MobileState() }
+    val layout = remember { PcLayoutState() }
 
-    // Real battery level + charging state
+    var selectedPage by remember { mutableStateOf("PC Control") }
+    var editMode by remember { mutableStateOf(false) }
+    var bagOpen by remember { mutableStateOf(false) }
+
+    // Permissions needed to read the Wi-Fi name and the connected Bluetooth device
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+    LaunchedEffect(Unit) {
+        val perms = buildList {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            if (Build.VERSION.SDK_INT >= 31) add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        permLauncher.launch(perms.toTypedArray())
+    }
+
+    // Poll the real mobile configuration
     LaunchedEffect(Unit) {
         while (true) {
-            val i = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            if (i != null) {
-                val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-                val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
-                if (level >= 0 && scale > 0) deck.batteryLevel = level * 100 / scale
-                val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-                deck.charging = st == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        st == BatteryManager.BATTERY_STATUS_FULL
-            }
-            delay(5000)
+            mobile.refresh(ctx)
+            delay(3000)
         }
+    }
+
+    val cycleSound: () -> Unit = {
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val next = (mobile.soundMode + 1) % 3
+        try {
+            am.ringerMode = when (next) {
+                0 -> AudioManager.RINGER_MODE_NORMAL
+                1 -> AudioManager.RINGER_MODE_VIBRATE
+                else -> AudioManager.RINGER_MODE_SILENT
+            }
+            mobile.soundMode = next
+        } catch (e: SecurityException) {
+            // Silent mode needs "Do Not Disturb access"
+            try {
+                ctx.startActivity(
+                    Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e2: Exception) { }
+        }
+    }
+
+    val goTo: (String) -> Unit = {
+        editMode = false
+        bagOpen = false
+        selectedPage = it
+    }
+    val toggleEdit: () -> Unit = {
+        if (!editMode) {
+            selectedPage = "PC Control"
+            editMode = true
+        } else {
+            editMode = false
+        }
+        bagOpen = false
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(IOSBgDark, Color(0xFF0F172A), Color(0xFF070A12))
-                )
-            )
+            .background(Brush.verticalGradient(listOf(IOSBgDark, Color(0xFF0F172A), Color(0xFF070A12))))
             .padding(12.dp)
     ) {
         Row(
@@ -349,11 +488,14 @@ fun SmartDeckApp() {
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 IOSTopStatusBar(
-                    deck = deck,
+                    mobile = mobile,
                     selectedPage = selectedPage,
-                    pcConnected = pcConnected,
-                    onSelectPage = { selectedPage = it },
-                    onToggleConnection = { pcConnected = !pcConnected }
+                    editMode = editMode,
+                    bagOpen = bagOpen,
+                    bagCount = layout.bag.size,
+                    onSelectPage = goTo,
+                    onToggleEdit = toggleEdit,
+                    onToggleBag = { bagOpen = !bagOpen }
                 )
 
                 Box(
@@ -370,7 +512,13 @@ fun SmartDeckApp() {
                         label = "GridPageTransition"
                     ) { page ->
                         when (page) {
-                            "PC Control" -> IOSPCControlGridDashboard(deck)
+                            "PC Control" -> IOSPCControlGridDashboard(
+                                deck = deck,
+                                layout = layout,
+                                editMode = editMode,
+                                bagOpen = bagOpen,
+                                onBagOpenChange = { bagOpen = it }
+                            )
                             "Touchpad" -> IOSTouchpadGridDashboard()
                             "Keyboard" -> IOSKeyboardGridDashboard()
                             "Smart Home" -> IOSSmartHomeGridDashboard()
@@ -381,25 +529,39 @@ fun SmartDeckApp() {
                 }
             }
 
-            IOSRightToolbar(
-                deck = deck,
-                selectedPage = selectedPage,
-                onSelectPage = { selectedPage = it }
-            )
+            // Right column: brand sits in the corner shared with the top bar
+            Column(
+                modifier = Modifier
+                    .width(190.dp)
+                    .fillMaxHeight(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                BrandHeader()
+                IOSRightToolbar(
+                    modifier = Modifier.weight(1f),
+                    mobile = mobile,
+                    selectedPage = selectedPage,
+                    onSelectPage = goTo,
+                    onCycleSound = cycleSound
+                )
+            }
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// TOP STATUS BAR
+// TOP BAR
 // -----------------------------------------------------------------------------
 @Composable
 fun IOSTopStatusBar(
-    deck: DeckState,
+    mobile: MobileState,
     selectedPage: String,
-    pcConnected: Boolean,
+    editMode: Boolean,
+    bagOpen: Boolean,
+    bagCount: Int,
     onSelectPage: (String) -> Unit,
-    onToggleConnection: () -> Unit
+    onToggleEdit: () -> Unit,
+    onToggleBag: () -> Unit
 ) {
     val now = rememberNow()
     val timeFmt = remember { SimpleDateFormat("hh:mm:ss a", Locale.getDefault()) }
@@ -415,82 +577,92 @@ fun IOSTopStatusBar(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Brand
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier
-                .fillMaxHeight()
-                .pressable(onToggleConnection)
-        ) {
-            Icon(Icons.Default.GridView, null, tint = IOSTileActive, modifier = Modifier.size(18.dp))
-            Text("SMART DECK", color = TextWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp, maxLines = 1)
-        }
-
-        // Right side (scrolls horizontally if the screen is too narrow)
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight(),
-            contentAlignment = Alignment.CenterEnd
+            contentAlignment = Alignment.CenterStart
         ) {
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                // Page shortcuts
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    TopBarActionButton(Icons.Default.Mouse, selectedPage == "Touchpad", "Touchpad") { onSelectPage("Touchpad") }
-                    TopBarActionButton(Icons.Default.Keyboard, selectedPage == "Keyboard", "Virtual Keyboard") { onSelectPage("Keyboard") }
-                    TopBarActionButton(Icons.Default.Dashboard, selectedPage == "PC Control", "Dashboard") { onSelectPage("PC Control") }
-                }
-
-                TopBarDivider()
-
-                // Connection status
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    IOSStatusChip(Icons.Default.Computer, null, pcConnected, "PC Link")
-                    IOSStatusChip(
-                        if (deck.charging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryFull,
-                        "${deck.batteryLevel}%", deck.charging || deck.batteryLevel > 15, "Battery"
-                    )
-                    IOSStatusChip(
-                        if (deck.wifiConnected) Icons.Default.Wifi else Icons.Default.WifiOff,
-                        if (deck.wifiConnected) deck.wifiName else null,
-                        deck.wifiConnected, "Wi-Fi"
-                    )
-                    IOSStatusChip(
-                        if (deck.btConnected) Icons.Default.BluetoothConnected else Icons.Default.BluetoothDisabled,
-                        if (deck.btConnected) deck.btDevice else null,
-                        deck.btConnected, "Bluetooth"
-                    )
-                }
-
-                TopBarDivider()
-
-                // Time + date
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Icon(Icons.Outlined.AccessTime, null, tint = StatusGreen, modifier = Modifier.size(15.dp))
-                        Text(timeFmt.format(now), color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            // Normal icons fade out, the "Add icon" button fades in
+            Crossfade(targetState = editMode, animationSpec = tween(250), label = "topbar") { editing ->
+                if (editing) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        AddIconButton(bagOpen, bagCount, onToggleBag)
+                        Text(
+                            "Drag to move  •  corner handle to resize  •  ✕ to remove",
+                            color = TextMuted,
+                            fontSize = 10.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Icon(Icons.Outlined.CalendarToday, null, tint = StatusGreen, modifier = Modifier.size(15.dp))
-                        Text(dateFmt.format(now), color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                } else {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            TopBarActionButton(Icons.Default.Mouse, selectedPage == "Touchpad", "Touchpad") { onSelectPage("Touchpad") }
+                            TopBarActionButton(Icons.Default.Keyboard, selectedPage == "Keyboard", "Virtual Keyboard") { onSelectPage("Keyboard") }
+                            TopBarActionButton(Icons.Default.Dashboard, selectedPage == "PC Control", "Dashboard") { onSelectPage("PC Control") }
+                        }
+
+                        TopBarDivider()
+
+                        IOSStatusChip(
+                            if (mobile.charging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryFull,
+                            "${mobile.batteryLevel}%",
+                            mobile.charging || mobile.batteryLevel > 15,
+                            "Battery"
+                        )
+
+                        TopBarDivider()
+
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Icon(Icons.Outlined.AccessTime, null, tint = StatusGreen, modifier = Modifier.size(15.dp))
+                            Text(timeFmt.format(now), color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            Icon(Icons.Outlined.CalendarToday, null, tint = StatusGreen, modifier = Modifier.size(15.dp))
+                            Text(dateFmt.format(now), color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                        }
                     }
                 }
             }
         }
+
+        // Edit button is always visible
+        TopBarActionButton(
+            if (editMode) Icons.Default.Check else Icons.Default.Edit,
+            editMode,
+            "Edit layout"
+        ) { onToggleEdit() }
+    }
+}
+
+@Composable
+fun AddIconButton(active: Boolean, count: Int, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .height(32.dp)
+            .pressable(onClick)
+            .clip(RoundedCornerShape(16.dp))
+            .background(if (active) IOSTileActive else IOSTileInactive)
+            .border(1.dp, if (active) TextWhite.copy(alpha = 0.5f) else IOSBorder, RoundedCornerShape(16.dp))
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Icon(Icons.Default.Add, null, tint = TextWhite, modifier = Modifier.size(15.dp))
+        Text("Add icon", color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        Text("$count/$BAG_CAPACITY", color = if (active) TextWhite else TextMuted, fontSize = 10.sp, maxLines = 1)
     }
 }
 
@@ -520,12 +692,7 @@ fun TopBarActionButton(
             .border(1.dp, if (selected) TextWhite.copy(alpha = 0.5f) else IOSBorder, CircleShape),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = tooltip,
-            tint = if (selected) TextWhite else TextMuted,
-            modifier = Modifier.size(15.dp)
-        )
+        Icon(icon, contentDescription = tooltip, tint = if (selected) TextWhite else TextMuted, modifier = Modifier.size(15.dp))
     }
 }
 
@@ -545,32 +712,42 @@ fun IOSStatusChip(icon: ImageVector, text: String?, active: Boolean, tooltip: St
             Icon(icon, contentDescription = tooltip, tint = if (active) StatusGreen else StatusGrey, modifier = Modifier.size(14.dp))
         }
         if (text != null) {
-            Text(
-                text,
-                color = TextWhite,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 90.dp)
-            )
+            Text(text, color = TextWhite, fontSize = 10.sp, fontWeight = FontWeight.Medium, maxLines = 1)
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// RIGHT TOOLBAR (scrollable)
+// RIGHT COLUMN: BRAND + SCROLLABLE TOOLBAR
 // -----------------------------------------------------------------------------
 @Composable
+fun BrandHeader() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .background(IOSCardBg, RoundedCornerShape(16.dp))
+            .border(1.dp, IOSBorder, RoundedCornerShape(16.dp)),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Icon(Icons.Default.GridView, null, tint = IOSTileActive, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("SMART DECK", color = TextWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp, maxLines = 1)
+    }
+}
+
+@Composable
 fun IOSRightToolbar(
-    deck: DeckState,
+    modifier: Modifier = Modifier,
+    mobile: MobileState,
     selectedPage: String,
-    onSelectPage: (String) -> Unit
+    onSelectPage: (String) -> Unit,
+    onCycleSound: () -> Unit
 ) {
     Box(
-        modifier = Modifier
-            .width(190.dp)
-            .fillMaxHeight()
+        modifier = modifier
+            .fillMaxWidth()
             .background(IOSCardBg, RoundedCornerShape(22.dp))
             .border(1.dp, IOSBorder, RoundedCornerShape(22.dp))
             .clip(RoundedCornerShape(22.dp))
@@ -582,48 +759,56 @@ fun IOSRightToolbar(
                 .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // ---------------- MOBILE SYSTEM ----------------
+            // ---------------- MOBILE SYSTEM (this device) ----------------
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 SectionLabel("MOBILE SYSTEM")
 
                 val batteryColor = when {
-                    deck.charging -> StatusGreen
-                    deck.batteryLevel <= 15 -> StatusRed
-                    deck.batteryLevel <= 30 -> StatusOrange
+                    mobile.charging -> StatusGreen
+                    mobile.batteryLevel <= 15 -> StatusRed
+                    mobile.batteryLevel <= 30 -> StatusOrange
                     else -> StatusGreen
                 }
                 IOSInfoRow(
-                    icon = if (deck.charging) Icons.Default.BatteryChargingFull
-                    else if (deck.batteryLevel <= 15) Icons.Default.BatteryAlert
-                    else Icons.Default.BatteryFull,
-                    text = if (deck.charging) "${deck.batteryLevel}% • Charging" else "${deck.batteryLevel}%",
+                    icon = when {
+                        mobile.charging -> Icons.Default.BatteryChargingFull
+                        mobile.batteryLevel <= 15 -> Icons.Default.BatteryAlert
+                        else -> Icons.Default.BatteryFull
+                    },
+                    text = if (mobile.charging) "${mobile.batteryLevel}% • Charging" else "${mobile.batteryLevel}%",
                     tint = batteryColor
                 )
 
                 IOSInfoRow(
-                    icon = if (deck.wifiConnected) Icons.Default.Wifi else Icons.Default.WifiOff,
-                    text = if (deck.wifiConnected) deck.wifiName else "Wi-Fi off",
-                    tint = if (deck.wifiConnected) StatusGreen else StatusGrey
+                    icon = if (mobile.wifiEnabled) Icons.Default.Wifi else Icons.Default.WifiOff,
+                    text = when {
+                        !mobile.wifiEnabled -> "Wi-Fi off"
+                        !mobile.wifiConnected -> "Not connected"
+                        else -> mobile.wifiName ?: "Connected"
+                    },
+                    tint = if (mobile.wifiConnected) StatusGreen else StatusGrey
                 )
 
                 IOSInfoRow(
-                    icon = if (deck.btConnected) Icons.Default.BluetoothConnected else Icons.Default.BluetoothDisabled,
-                    text = if (deck.btConnected) deck.btDevice else "Bluetooth off",
-                    tint = if (deck.btConnected) StatusGreen else StatusGrey
+                    icon = when {
+                        !mobile.btEnabled -> Icons.Default.BluetoothDisabled
+                        mobile.btDevice != null -> Icons.Default.BluetoothConnected
+                        else -> Icons.Default.Bluetooth
+                    },
+                    text = when {
+                        !mobile.btEnabled -> "Bluetooth off"
+                        else -> mobile.btDevice ?: "Not connected"
+                    },
+                    tint = if (mobile.btDevice != null) StatusGreen else StatusGrey
                 )
 
                 // Tap to cycle: Sound -> Vibrate -> Mute
-                val (soundIcon, soundText, soundTint) = when (deck.soundMode) {
+                val (soundIcon, soundText, soundTint) = when (mobile.soundMode) {
                     0 -> Triple(Icons.Default.VolumeUp, "Sound", StatusGreen)
                     1 -> Triple(Icons.Default.Vibration, "Vibrate", StatusOrange)
                     else -> Triple(Icons.Default.VolumeOff, "Mute", StatusRed)
                 }
-                IOSInfoRow(
-                    icon = soundIcon,
-                    text = soundText,
-                    tint = soundTint,
-                    onClick = { deck.cycleSound() }
-                )
+                IOSInfoRow(icon = soundIcon, text = soundText, tint = soundTint, onClick = onCycleSound)
             }
 
             // ---------------- CONTROL MODULES ----------------
@@ -696,139 +881,621 @@ fun IOSNavRow(
 }
 
 // -----------------------------------------------------------------------------
-// 1. PC CONTROL (same setup as the Control Center + PC buttons)
+// 1. PC CONTROL (editable: drag, resize, remove, add from the 3x3 bag)
 // -----------------------------------------------------------------------------
+private fun snapMoved(t: Tile, off: Offset, sx: Float, sy: Float): Tile = t.copy(
+    col = (t.col + off.x / sx).roundToInt().coerceIn(0, PC_COLS - t.colSpan),
+    row = (t.row + off.y / sy).roundToInt().coerceIn(0, PC_ROWS - t.rowSpan)
+)
+
+private fun snapResized(t: Tile, off: Offset, sx: Float, sy: Float): Tile = t.copy(
+    colSpan = (t.colSpan + off.x / sx).roundToInt().coerceIn(1, PC_COLS - t.col),
+    rowSpan = (t.rowSpan + off.y / sy).roundToInt().coerceIn(1, PC_ROWS - t.row)
+)
+
 @Composable
-fun IOSPCControlGridDashboard(deck: DeckState) {
-    val tiles = remember { DefaultLayouts.pc }
+fun IOSPCControlGridDashboard(
+    deck: DeckState,
+    layout: PcLayoutState,
+    editMode: Boolean,
+    bagOpen: Boolean,
+    onBagOpenChange: (Boolean) -> Unit
+) {
+    val gap = 10.dp
+    val density = LocalDensity.current
 
-    TileGrid(columns = 8, rows = 5, tiles = tiles) { t ->
-        when (t.id) {
-            "wifi" -> CCLabelTile(
-                if (deck.wifiConnected) Icons.Default.Wifi else Icons.Default.WifiOff,
-                "Wi-Fi",
-                if (deck.wifiConnected) deck.wifiName else "Off",
-                deck.wifiConnected
-            ) { deck.wifi = !deck.wifi }
+    var gridRoot by remember { mutableStateOf(Offset.Zero) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var lastError by remember { mutableStateOf("") }
+    var bagDragId by remember { mutableStateOf<String?>(null) }
+    var bagDragPos by remember { mutableStateOf(Offset.Zero) }
+    var flippedId by remember { mutableStateOf<String?>(null) }
 
-            "bluetooth" -> CCLabelTile(
-                if (deck.btConnected) Icons.Default.BluetoothConnected else Icons.Default.Bluetooth,
-                "Bluetooth",
-                if (deck.btConnected) deck.btDevice else "Off",
-                deck.btConnected
-            ) { deck.bluetooth = !deck.bluetooth }
+    LaunchedEffect(error) {
+        val e = error
+        if (e != null) {
+            lastError = e
+            delay(3200)
+            error = null
+        }
+    }
+    LaunchedEffect(flippedId) {
+        if (flippedId != null) {
+            delay(3000)
+            flippedId = null
+        }
+    }
+    LaunchedEffect(editMode) {
+        if (!editMode) {
+            flippedId = null
+            bagDragId = null
+        }
+    }
 
-            "connect" -> CCTile(Modifier.fillMaxSize()) {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(8.dp),
-                    verticalArrangement = Arrangement.SpaceEvenly
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { gridRoot = it.positionInRoot() }
+    ) {
+        val gapPx = with(density) { gap.toPx() }
+        val cellW = (constraints.maxWidth - gapPx * (PC_COLS - 1)) / PC_COLS
+        val cellH = (constraints.maxHeight - gapPx * (PC_ROWS - 1)) / PC_ROWS
+        val stepX = cellW + gapPx
+        val stepY = cellH + gapPx
+
+        fun fits(c: Tile): Boolean {
+            if (c.col < 0 || c.row < 0 || c.col + c.colSpan > PC_COLS || c.row + c.rowSpan > PC_ROWS) return false
+            return layout.tiles.none { o ->
+                o.id != c.id &&
+                        c.col < o.col + o.colSpan && o.col < c.col + c.colSpan &&
+                        c.row < o.row + o.rowSpan && o.row < c.row + c.rowSpan
+            }
+        }
+
+        fun candidateFor(id: String, pos: Offset): Tile {
+            val d = defOf(id)
+            val wPx = d.colSpan * stepX - gapPx
+            val hPx = d.rowSpan * stepY - gapPx
+            return Tile(
+                id,
+                ((pos.x - wPx / 2) / stepX).roundToInt().coerceIn(0, PC_COLS - d.colSpan),
+                ((pos.y - hPx / 2) / stepY).roundToInt().coerceIn(0, PC_ROWS - d.rowSpan),
+                d.colSpan,
+                d.rowSpan
+            )
+        }
+
+        // ---------------- tiles ----------------
+        layout.tiles.toList().forEach { t ->
+            key(t.id) {
+                EditableTileFrame(
+                    tile = t,
+                    editMode = editMode,
+                    stepX = stepX,
+                    stepY = stepY,
+                    gapPx = gapPx,
+                    fits = { fits(it) },
+                    onCommit = { n ->
+                        val i = layout.tiles.indexOfFirst { it.id == n.id }
+                        if (i >= 0) layout.tiles[i] = n
+                    },
+                    onRemove = {
+                        if (layout.bag.size >= BAG_CAPACITY) {
+                            error = "Icon panel is full ($BAG_CAPACITY/$BAG_CAPACITY). Tap an icon in the panel, then ✕, to free up space."
+                            onBagOpenChange(true)
+                        } else {
+                            layout.tiles.removeAll { it.id == t.id }
+                            layout.bag.add(t.id)
+                        }
+                    }
                 ) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        CCRoundButton(Icons.Default.AirplanemodeActive, deck.airplane) { deck.airplane = !deck.airplane }
-                        CCRoundButton(Icons.Default.WifiTethering, deck.hotspot) { deck.hotspot = !deck.hotspot }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        CCRoundButton(Icons.Default.Wifi, deck.wifi) { deck.wifi = !deck.wifi }
-                        CCRoundButton(Icons.Default.Bluetooth, deck.bluetooth) { deck.bluetooth = !deck.bluetooth }
-                    }
+                    PcTileContent(t.id, deck)
                 }
             }
+        }
 
-            "media" -> CCTile(Modifier.fillMaxSize()) {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(12.dp),
-                    verticalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .background(Brush.linearGradient(listOf(Color(0xFF3B82F6), Color(0xFF1E3A8A))), RoundedCornerShape(10.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.MusicNote, null, tint = TextWhite, modifier = Modifier.size(20.dp))
+        // ---------------- drag from bag: target + ghost ----------------
+        val dragId = bagDragId
+        if (dragId != null) {
+            val cand = candidateFor(dragId, bagDragPos)
+            val ok = fits(cand)
+            val color = if (ok) StatusGreen else StatusRed
+            Box(
+                Modifier
+                    .offset { IntOffset((cand.col * stepX).roundToInt(), (cand.row * stepY).roundToInt()) }
+                    .size(
+                        width = with(density) { (cand.colSpan * stepX - gapPx).toDp() },
+                        height = with(density) { (cand.rowSpan * stepY - gapPx).toDp() }
+                    )
+                    .background(color.copy(alpha = 0.18f), RoundedCornerShape(22.dp))
+                    .border(2.dp, color, RoundedCornerShape(22.dp))
+            )
+            Box(
+                Modifier
+                    .offset { IntOffset((bagDragPos.x - 28.dp.toPx()).roundToInt(), (bagDragPos.y - 28.dp.toPx()).roundToInt()) }
+                    .size(56.dp)
+                    .zIndex(20f)
+                    .background(IOSTileActive, RoundedCornerShape(16.dp))
+                    .border(1.dp, TextWhite.copy(alpha = 0.6f), RoundedCornerShape(16.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(defOf(dragId).icon, null, tint = TextWhite, modifier = Modifier.size(26.dp))
+            }
+        }
+
+        // ---------------- 3x3 icon bag ----------------
+        AnimatedVisibility(
+            visible = editMode && bagOpen,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(6.dp)
+                .zIndex(15f),
+            enter = fadeIn(tween(200)) + scaleIn(initialScale = 0.92f),
+            exit = fadeOut(tween(150)) + scaleOut(targetScale = 0.92f)
+        ) {
+            BagPanel(
+                bag = layout.bag,
+                flippedId = flippedId,
+                draggingId = bagDragId,
+                gridRoot = { gridRoot },
+                onFlip = { flippedId = it },
+                onDelete = { id ->
+                    layout.bag.remove(id)
+                    flippedId = null
+                },
+                onReset = { layout.reset(); flippedId = null },
+                onDragStart = { id, pos -> bagDragId = id; bagDragPos = pos },
+                onDrag = { pos -> bagDragPos = pos },
+                onDragEnd = {
+                    val id = bagDragId
+                    if (id != null) {
+                        val cand = candidateFor(id, bagDragPos)
+                        if (fits(cand)) {
+                            layout.tiles.add(cand)
+                            layout.bag.remove(id)
+                        } else {
+                            error = "No free space there. Drop on an empty spot, or move/shrink other icons first."
                         }
-                        Column(Modifier.weight(1f)) {
-                            Text("Midnight City", color = TextWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-                            Text("M83 • Synthwave", color = TextMuted, fontSize = 10.sp, maxLines = 1)
-                        }
-                        Icon(Icons.Default.Cast, null, tint = TextMuted, modifier = Modifier.size(18.dp))
                     }
-                    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        LinearProgressIndicator(
-                            progress = { 0.35f },
-                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
-                            color = CCWhite,
-                            trackColor = IOSTileInactive
+                    bagDragId = null
+                }
+            )
+        }
+
+        // ---------------- error popup (bottom) ----------------
+        AnimatedVisibility(
+            visible = error != null,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 10.dp)
+                .zIndex(30f),
+            enter = fadeIn(tween(150)) + slideInVertically { it },
+            exit = fadeOut(tween(150)) + slideOutVertically { it }
+        ) {
+            Row(
+                modifier = Modifier
+                    .widthIn(max = 460.dp)
+                    .background(Color(0xFF7F1D1D), RoundedCornerShape(14.dp))
+                    .border(1.dp, StatusRed, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(Icons.Default.ErrorOutline, null, tint = TextWhite, modifier = Modifier.size(18.dp))
+                Text(lastError, color = TextWhite, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+    }
+}
+
+/** Wraps one tile: normal when not editing; draggable, resizable and removable when editing. */
+@Composable
+fun EditableTileFrame(
+    tile: Tile,
+    editMode: Boolean,
+    stepX: Float,
+    stepY: Float,
+    gapPx: Float,
+    fits: (Tile) -> Boolean,
+    onCommit: (Tile) -> Unit,
+    onRemove: () -> Unit,
+    content: @Composable BoxScope.() -> Unit
+) {
+    val density = LocalDensity.current
+    val curTile by rememberUpdatedState(tile)
+    val curFits by rememberUpdatedState(fits)
+    val curCommit by rememberUpdatedState(onCommit)
+    val curSx by rememberUpdatedState(stepX)
+    val curSy by rememberUpdatedState(stepY)
+
+    var dragOff by remember { mutableStateOf(Offset.Zero) }
+    var resizeOff by remember { mutableStateOf(Offset.Zero) }
+    var moving by remember { mutableStateOf(false) }
+    var resizing by remember { mutableStateOf(false) }
+    val active = moving || resizing
+
+    val baseX = tile.col * stepX
+    val baseY = tile.row * stepY
+    val baseW = tile.colSpan * stepX - gapPx
+    val baseH = tile.rowSpan * stepY - gapPx
+    val minW = stepX - gapPx
+    val minH = stepY - gapPx
+
+    // Snapped preview while dragging / resizing
+    if (active) {
+        val preview = if (moving) snapMoved(tile, dragOff, stepX, stepY) else snapResized(tile, resizeOff, stepX, stepY)
+        val ok = fits(preview)
+        val c = if (ok) StatusGreen else StatusRed
+        Box(
+            Modifier
+                .offset { IntOffset((preview.col * stepX).roundToInt(), (preview.row * stepY).roundToInt()) }
+                .size(
+                    width = with(density) { (preview.colSpan * stepX - gapPx).toDp() },
+                    height = with(density) { (preview.rowSpan * stepY - gapPx).toDp() }
+                )
+                .background(c.copy(alpha = 0.18f), RoundedCornerShape(22.dp))
+                .border(2.dp, c, RoundedCornerShape(22.dp))
+        )
+    }
+
+    val inf = rememberInfiniteTransition(label = "wiggle")
+    val wig by inf.animateFloat(
+        initialValue = -0.7f,
+        targetValue = 0.7f,
+        animationSpec = infiniteRepeatable(tween(160, easing = LinearEasing), RepeatMode.Reverse),
+        label = "wig"
+    )
+
+    Box(
+        modifier = Modifier
+            .offset { IntOffset((baseX + dragOff.x).roundToInt(), (baseY + dragOff.y).roundToInt()) }
+            .size(
+                width = with(density) { (baseW + resizeOff.x).coerceAtLeast(minW).toDp() },
+                height = with(density) { (baseH + resizeOff.y).coerceAtLeast(minH).toDp() }
+            )
+            .zIndex(if (active) 10f else 0f)
+            .graphicsLayer {
+                rotationZ = if (editMode && !active) wig * (if (tile.col % 2 == 0) 1f else -1f) else 0f
+                val s = if (moving) 1.05f else 1f
+                scaleX = s
+                scaleY = s
+                alpha = if (moving) 0.9f else 1f
+            }
+            .then(
+                if (editMode) Modifier.pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { moving = true },
+                        onDragEnd = {
+                            val n = snapMoved(curTile, dragOff, curSx, curSy)
+                            if (curFits(n)) curCommit(n)
+                            dragOff = Offset.Zero
+                            moving = false
+                        },
+                        onDragCancel = { dragOff = Offset.Zero; moving = false },
+                        onDrag = { change, amount ->
+                            change.consume()
+                            dragOff += amount
+                        }
+                    )
+                } else Modifier
+            )
+    ) {
+        content()
+
+        if (editMode) {
+            // Blocks the tile's own buttons while editing
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .pointerInput(Unit) { detectTapGestures { } }
+            )
+
+            // Remove badge
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(3.dp)
+                    .size(22.dp)
+                    .pressable(onRemove)
+                    .clip(CircleShape)
+                    .background(StatusRed)
+                    .border(1.dp, TextWhite.copy(alpha = 0.7f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.Close, null, tint = TextWhite, modifier = Modifier.size(13.dp))
+            }
+
+            // Resize handle
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(3.dp)
+                    .size(24.dp)
+                    .clip(CircleShape)
+                    .background(IOSTileActive)
+                    .border(1.dp, TextWhite.copy(alpha = 0.7f), CircleShape)
+                    .pointerInput(Unit) {
+                        detectDragGestures(
+                            onDragStart = { resizing = true },
+                            onDragEnd = {
+                                val n = snapResized(curTile, resizeOff, curSx, curSy)
+                                if (curFits(n)) curCommit(n)
+                                resizeOff = Offset.Zero
+                                resizing = false
+                            },
+                            onDragCancel = { resizeOff = Offset.Zero; resizing = false },
+                            onDrag = { change, amount ->
+                                change.consume()
+                                resizeOff += amount
+                            }
                         )
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("1:24", color = TextMuted, fontSize = 8.sp)
-                            Text("-2:36", color = TextMuted, fontSize = 8.sp)
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Default.OpenInFull, null, tint = TextWhite, modifier = Modifier.size(12.dp))
+            }
+        }
+    }
+}
+
+// ---------------- 3x3 bag ----------------
+@Composable
+fun BagPanel(
+    bag: List<String>,
+    flippedId: String?,
+    draggingId: String?,
+    gridRoot: () -> Offset,
+    onFlip: (String?) -> Unit,
+    onDelete: (String) -> Unit,
+    onReset: () -> Unit,
+    onDragStart: (String, Offset) -> Unit,
+    onDrag: (Offset) -> Unit,
+    onDragEnd: () -> Unit
+) {
+    val shape = RoundedCornerShape(20.dp)
+    Column(
+        modifier = Modifier
+            .graphicsLayer { alpha = if (draggingId != null) 0.35f else 1f }
+            .background(PanelBg, shape)
+            .border(1.dp, IOSBorder, shape)
+            .pointerInput(Unit) { detectTapGestures { } }
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(
+            modifier = Modifier.width(3 * 48.dp + 2 * 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("ICON BAG  ${bag.size}/$BAG_CAPACITY", color = TextMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+            Text(
+                "Reset",
+                color = IOSTileActive,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.pressable(onReset)
+            )
+        }
+        for (r in 0 until 3) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (c in 0 until 3) {
+                    val id = bag.getOrNull(r * 3 + c)
+                    if (id == null) {
+                        Box(
+                            Modifier
+                                .size(48.dp)
+                                .background(Color.White.copy(alpha = 0.04f), RoundedCornerShape(12.dp))
+                                .border(1.dp, IOSBorder.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        )
+                    } else {
+                        key(id) {
+                            BagItem(
+                                def = defOf(id),
+                                flipped = flippedId == id,
+                                dragging = draggingId == id,
+                                gridRoot = gridRoot,
+                                onFlip = { onFlip(id) },
+                                onDelete = { onDelete(id) },
+                                onDragStart = { pos -> onDragStart(id, pos) },
+                                onDrag = onDrag,
+                                onDragEnd = onDragEnd
+                            )
                         }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                        MediaButton(Icons.Default.SkipPrevious, 38.dp, false) { sendPcCommand("media_prev") }
-                        MediaButton(if (deck.playing) Icons.Default.Pause else Icons.Default.PlayArrow, 38.dp, false) {
-                            deck.playing = !deck.playing
-                            sendPcCommand("media_play_pause")
-                        }
-                        MediaButton(Icons.Default.SkipNext, 38.dp, false) { sendPcCommand("media_next") }
                     }
                 }
-            }
-
-            "brightness" -> VerticalPillSlider(
-                value = deck.brightness,
-                onValueChange = { deck.brightness = it },
-                fill = CCWhite,
-                trackColor = CCGlass,
-                modifier = Modifier.fillMaxSize()
-            ) {
-                Icon(
-                    Icons.Default.BrightnessHigh, null,
-                    tint = if (deck.brightness > 12f) CCDarkIcon else TextWhite,
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp).size(22.dp)
-                )
-            }
-
-            "volume" -> VerticalPillSlider(
-                value = if (deck.muted) 0f else deck.volume,
-                onValueChange = { deck.volume = it; if (deck.muted) deck.soundMode = 0 },
-                fill = CCWhite,
-                trackColor = CCGlass,
-                modifier = Modifier.fillMaxSize()
-            ) {
-                Icon(
-                    when {
-                        deck.muted || deck.volume == 0f -> Icons.Default.VolumeOff
-                        deck.soundMode == 1 -> Icons.Default.Vibration
-                        else -> Icons.Default.VolumeUp
-                    }, null,
-                    tint = if (!deck.muted && deck.volume > 12f) IOSTileActive else TextWhite,
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp).size(22.dp)
-                )
-            }
-
-            "dark" -> CCIconTile(Icons.Default.DarkMode, deck.on("dark")) { deck.flip("dark") }
-            "lowpower" -> CCIconTile(Icons.Default.BatteryChargingFull, deck.on("lowpower")) { deck.flip("lowpower") }
-
-            else -> {
-                val action = PcActions.firstOrNull { it.id == t.id }
-                if (action != null) PCActionButton(action) { sendPcCommand(action.id) }
             }
         }
     }
 }
 
 @Composable
-fun PCActionButton(action: PcAction, onClick: () -> Unit) {
+fun BagItem(
+    def: PcTileDef,
+    flipped: Boolean,
+    dragging: Boolean,
+    gridRoot: () -> Offset,
+    onFlip: () -> Unit,
+    onDelete: () -> Unit,
+    onDragStart: (Offset) -> Unit,
+    onDrag: (Offset) -> Unit,
+    onDragEnd: () -> Unit
+) {
+    var itemRoot by remember { mutableStateOf(Offset.Zero) }
+    val rot by animateFloatAsState(if (flipped) 180f else 0f, tween(320), label = "flip")
+
+    val curFlip by rememberUpdatedState(onFlip)
+    val curDelete by rememberUpdatedState(onDelete)
+    val curStart by rememberUpdatedState(onDragStart)
+    val curDrag by rememberUpdatedState(onDrag)
+    val curEnd by rememberUpdatedState(onDragEnd)
+    val curGrid by rememberUpdatedState(gridRoot)
+
+    Box(
+        modifier = Modifier
+            .size(48.dp)
+            .onGloballyPositioned { itemRoot = it.positionInRoot() }
+            .graphicsLayer {
+                rotationY = rot
+                cameraDistance = 12f * density
+                alpha = if (dragging) 0.3f else 1f
+            }
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (rot > 90f) StatusRed else CCRound)
+            .pointerInput(flipped) {
+                detectTapGestures(onTap = { if (flipped) curDelete() else curFlip() })
+            }
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { off -> curStart(itemRoot - curGrid() + off) },
+                    onDragEnd = { curEnd() },
+                    onDragCancel = { curEnd() },
+                    onDrag = { change, _ ->
+                        change.consume()
+                        curDrag(itemRoot - curGrid() + change.position)
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (rot <= 90f) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Icon(def.icon, null, tint = TextWhite, modifier = Modifier.size(18.dp))
+                Text(def.label, color = TextMuted, fontSize = 7.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        } else {
+            Icon(
+                Icons.Default.Close, null, tint = TextWhite,
+                modifier = Modifier
+                    .size(22.dp)
+                    .graphicsLayer { rotationY = 180f }
+            )
+        }
+    }
+}
+
+// ---------------- tile contents ----------------
+@Composable
+fun PcTileContent(id: String, deck: DeckState) {
+    when (id) {
+        "wifi" -> CCLabelTile(
+            Icons.Default.Router, "Wi-Fi", if (deck.pcWifi) "PC • On" else "PC • Off", deck.pcWifi
+        ) { deck.pcWifi = !deck.pcWifi }
+
+        "bluetooth" -> CCLabelTile(
+            Icons.Default.Bluetooth, "Bluetooth", if (deck.pcBluetooth) "PC • On" else "PC • Off", deck.pcBluetooth
+        ) { deck.pcBluetooth = !deck.pcBluetooth }
+
+        "connect" -> CCTile(Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(8.dp),
+                verticalArrangement = Arrangement.SpaceEvenly
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    CCRoundButton(Icons.Default.AirplanemodeActive, deck.airplane) { deck.airplane = !deck.airplane }
+                    CCRoundButton(Icons.Default.WifiTethering, deck.hotspot) { deck.hotspot = !deck.hotspot }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    CCRoundButton(Icons.Default.ScreenLockRotation, deck.on("orient")) { deck.flip("orient") }
+                    CCRoundButton(Icons.Default.DoNotDisturbOn, deck.on("dnd")) { deck.flip("dnd") }
+                }
+            }
+        }
+
+        "media" -> CCTile(Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(12.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Track info on the left, controls on the right side
+                Row(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .background(Brush.linearGradient(listOf(Color(0xFF3B82F6), Color(0xFF1E3A8A))), RoundedCornerShape(10.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.MusicNote, null, tint = TextWhite, modifier = Modifier.size(20.dp))
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text("Midnight City", color = TextWhite, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("M83 • Synthwave", color = TextMuted, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        MediaButton(Icons.Default.SkipPrevious, 34.dp, false) { sendPcCommand("media_prev") }
+                        MediaButton(if (deck.playing) Icons.Default.Pause else Icons.Default.PlayArrow, 40.dp, true) {
+                            deck.playing = !deck.playing
+                            sendPcCommand("media_play_pause")
+                        }
+                        MediaButton(Icons.Default.SkipNext, 34.dp, false) { sendPcCommand("media_next") }
+                    }
+                }
+                // Duration bar across the full width at the bottom
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    LinearProgressIndicator(
+                        progress = { 0.35f },
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = CCWhite,
+                        trackColor = IOSTileInactive
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("1:24", color = TextMuted, fontSize = 8.sp)
+                        Text("-2:36", color = TextMuted, fontSize = 8.sp)
+                    }
+                }
+            }
+        }
+
+        "brightness" -> VerticalPillSlider(
+            value = deck.brightness,
+            onValueChange = { deck.brightness = it },
+            fill = CCWhite,
+            trackColor = CCGlass,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Icon(
+                Icons.Default.BrightnessHigh, null,
+                tint = if (deck.brightness > 12f) CCDarkIcon else TextWhite,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp).size(22.dp)
+            )
+        }
+
+        "volume" -> VerticalPillSlider(
+            value = deck.volume,
+            onValueChange = { deck.volume = it },
+            fill = CCWhite,
+            trackColor = CCGlass,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Icon(
+                if (deck.volume == 0f) Icons.Default.VolumeOff else Icons.Default.VolumeUp, null,
+                tint = if (deck.volume > 12f) IOSTileActive else TextWhite,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp).size(22.dp)
+            )
+        }
+
+        "dark" -> CCIconTile(Icons.Default.DarkMode, deck.on("dark")) { deck.flip("dark") }
+        "lowpower" -> CCIconTile(Icons.Default.BatterySaver, deck.on("lowpower")) { deck.flip("lowpower") }
+
+        else -> {
+            val d = PcTileDefs.firstOrNull { it.id == id }
+            if (d != null && d.isAction) PCActionButton(d) { sendPcCommand(d.id) }
+        }
+    }
+}
+
+@Composable
+fun PCActionButton(def: PcTileDef, onClick: () -> Unit) {
     val shape = RoundedCornerShape(16.dp)
     Box(
         modifier = Modifier
             .fillMaxSize()
             .pressable(onClick)
             .clip(shape)
-            .background(if (action.danger) StatusRed.copy(alpha = 0.85f) else CCGlass)
+            .background(if (def.danger) StatusRed.copy(alpha = 0.85f) else CCGlass)
             .border(1.dp, IOSBorder, shape),
         contentAlignment = Alignment.Center
     ) {
@@ -836,15 +1503,8 @@ fun PCActionButton(action: PcAction, onClick: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            Icon(action.icon, null, tint = TextWhite, modifier = Modifier.size(18.dp))
-            Text(
-                action.label,
-                color = TextWhite,
-                fontSize = 8.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Icon(def.icon, null, tint = TextWhite, modifier = Modifier.size(18.dp))
+            Text(def.label, color = TextWhite, fontSize = 8.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -859,7 +1519,7 @@ fun MediaButton(icon: ImageVector, size: Dp, filled: Boolean, onClick: () -> Uni
             .background(if (filled) IOSTileActive else Color.Transparent),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, null, tint = TextWhite, modifier = Modifier.size(20.dp))
+        Icon(icon, null, tint = TextWhite, modifier = Modifier.size(size * 0.55f))
     }
 }
 
